@@ -1,3 +1,9 @@
-﻿.env
-.env.*
-!.env.example
+﻿# Vector DB
+backend/rag/chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+
+# Env
+.env
