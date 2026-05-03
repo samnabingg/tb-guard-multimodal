@@ -18,15 +18,25 @@ Architecture:
             │  (consensus     │
             │   + RAG retry)  │
             └─────────────────┘
+
+Fixes applied (v2):
+  1. _safe_invoke() — wraps every agent so a single auth/network
+     failure returns a degraded string instead of crashing
+     RunnableParallel and returning HTTP 500.
+  2. Lambda closure bug fixed — each lambda now receives its own
+     captured copy of `rag_ctx` and `chain` via default arguments,
+     preventing all lambdas from accidentally sharing the last
+     assigned value of the loop variable.
 """
 
-import os, sys
+import os
+import sys
 from dotenv import load_dotenv
 
 # ── LangChain imports ──────────────────────────────────────────────────────────
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, RunnableParallel
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
@@ -86,6 +96,51 @@ def _retrieve_context(query: str, vector_store, k: int = 4) -> str:
     results = retrieve(query, vector_store, k=k)
     return "\n\n".join(r.page_content for r in results)
 
+
+def _safe_invoke(agent_name: str, chain, inputs: dict) -> str:
+    """
+    FIX 1: Fault-tolerant agent wrapper.
+
+    Wraps any LangChain chain invocation so that a single agent
+    failure (401 auth, timeout, API quota, etc.) returns a degraded
+    placeholder string instead of raising an exception that would
+    crash the entire RunnableParallel and return HTTP 500.
+
+    The Judge Agent is designed to handle UNAVAILABLE agents
+    gracefully by marking them as missing data rather than failing.
+    """
+    try:
+        result = chain.invoke(inputs)
+        # chain already ends with StrOutputParser so result is a plain str,
+        # but guard against AIMessage in case chain is swapped later.
+        return result.content if hasattr(result, "content") else str(result)
+    except Exception as e:
+        error_type = type(e).__name__
+        short_msg = str(e)[:200]
+        print(f"[WARN] {agent_name} agent FAILED ({error_type}): {short_msg}")
+        # Return a structured degraded response the Judge can read
+        return (
+            f"[{agent_name.upper()} AGENT UNAVAILABLE]\n"
+            f"Reason: {error_type} — {short_msg}\n"
+            f"This agent's modality is excluded from the consensus. "
+            f"Judge should proceed with remaining agents and flag this gap."
+        )
+
+
+def _has_data(val) -> bool:
+    """
+    Returns True only if the modality field contains real data.
+    Rejects None, empty string, whitespace-only, and common
+    placeholder strings that data_loader emits when data is absent.
+    """
+    if not val:
+        return False
+    s = str(val).strip().lower()
+    if not s:
+        return False
+    # Reject known placeholder patterns from data_loader
+    EMPTY_SIGNALS = {"none", "n/a", "not available", "no data", "missing", "unavailable", "nan"}
+    return s not in EMPTY_SIGNALS
 
 def _build_agent_chain(llm, prompt_template: ChatPromptTemplate, agent_name: str):
     """
@@ -174,6 +229,9 @@ Analyze these X-ray findings for TB. Provide:
 judge_prompt = ChatPromptTemplate.from_template("""You are the Integration and Judge Agent for the TB-Guard Council of AI.
 You have received conclusions from {agent_count} specialist agent(s).
 
+NOTE: Some agents may show [AGENT UNAVAILABLE] — treat these as missing modalities,
+not as negative findings. Base your verdict only on the agents that responded.
+
 AGENT CONCLUSIONS:
 {transcript}
 
@@ -200,6 +258,9 @@ POINTS OF AGREEMENT:
 
 POINTS OF CONFLICT:
 [Where agents disagreed and how you resolved it]
+
+UNAVAILABLE AGENTS:
+[List any agents that were unavailable and what gap this leaves in the assessment]
 
 RECOMMENDED NEXT STEPS:
 [Clinical actions following from this verdict]
@@ -302,7 +363,7 @@ def judge_agent(agent_conclusions: list[dict], vector_store, rag_context: str = 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PARALLEL COUNCIL RUNNER  ← The key LangChain upgrade
+# PARALLEL COUNCIL RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_council_parallel(patient_case: dict) -> dict:
@@ -311,72 +372,90 @@ def run_council_parallel(patient_case: dict) -> dict:
     runs all available specialist agents simultaneously, then passes
     their combined conclusions to the Judge Agent.
 
-    This is the LangChain-native orchestration entry point.
+    Two bugs fixed vs v1:
+      - FIX 1: _safe_invoke wraps every agent branch so one failure
+        does not crash the whole parallel runner.
+      - FIX 2: Lambda default-argument capture (`chain=chain, ctx=rag_ctx`)
+        ensures each lambda holds its OWN snapshot of chain and rag_ctx
+        instead of all sharing the last value assigned to the variable
+        (classic Python late-binding closure trap).
     """
     print("\n[TB-GUARD] Council of AI — Starting parallel deliberation...\n")
     vector_store = load_vector_store()
 
-    # ── Determine which agents to run ──────────────────────────────────────────
     parallel_branches = {}
 
-    if patient_case.get("clinical_data"):
+    # ── Clinical ───────────────────────────────────────────────────────────────
+    if _has_data(patient_case.get("clinical_data")):
         rag_ctx = _retrieve_context(
             "TB clinical presentation symptoms risk factors treatment history",
             vector_store
         )
-        clinical_chain = (
-            clinical_prompt
-            | clinical_llm
-            | StrOutputParser()
-        )
+        clinical_chain = clinical_prompt | clinical_llm | StrOutputParser()
+
+        # FIX 2: capture chain and ctx NOW via default args, not at call time
         parallel_branches["clinical"] = RunnableLambda(
-            lambda _: clinical_chain.invoke({
-                "clinical_data": patient_case["clinical_data"],
-                "rag_context": rag_ctx,
-            })
+            lambda _, chain=clinical_chain, ctx=rag_ctx: _safe_invoke(
+                "clinical", chain,
+                {
+                    "clinical_data": patient_case["clinical_data"],
+                    "rag_context": ctx,
+                }
+            )
         )
 
-    if patient_case.get("genomic_data"):
+    # ── Genomic ────────────────────────────────────────────────────────────────
+    if _has_data(patient_case.get("genomic_data")):
         rag_ctx = _retrieve_context(
             "MDR XDR tuberculosis resistance markers genomic mutations rifampicin isoniazid",
             vector_store
         )
-        genomic_chain = (
-            genomic_prompt
-            | genomic_llm
-            | StrOutputParser()
-        )
+        genomic_chain = genomic_prompt | genomic_llm | StrOutputParser()
+
         parallel_branches["genomic"] = RunnableLambda(
-            lambda _: genomic_chain.invoke({
-                "genomic_data": patient_case["genomic_data"],
-                "rag_context": rag_ctx,
-            })
+            lambda _, chain=genomic_chain, ctx=rag_ctx: _safe_invoke(
+                "genomic", chain,
+                {
+                    "genomic_data": patient_case["genomic_data"],
+                    "rag_context": ctx,
+                }
+            )
         )
 
-    if patient_case.get("ct_data"):
+    # ── CT ─────────────────────────────────────────────────────────────────────
+    if _has_data(patient_case.get("ct_data")):
         rag_ctx = _retrieve_context(
             "tuberculosis CT scan findings cavitation nodules consolidation",
             vector_store
         )
         ct_chain = ct_prompt | ct_llm | StrOutputParser()
+
         parallel_branches["ct"] = RunnableLambda(
-            lambda _: ct_chain.invoke({
-                "ct_data": patient_case["ct_data"],
-                "rag_context": rag_ctx,
-            })
+            lambda _, chain=ct_chain, ctx=rag_ctx: _safe_invoke(
+                "ct", chain,
+                {
+                    "ct_data": patient_case["ct_data"],
+                    "rag_context": ctx,
+                }
+            )
         )
 
-    if patient_case.get("xray_data"):
+    # ── X-Ray ──────────────────────────────────────────────────────────────────
+    if _has_data(patient_case.get("xray_data")):
         rag_ctx = _retrieve_context(
             "tuberculosis chest X-ray radiological signs infiltrates cavitation upper lobe",
             vector_store
         )
         xray_chain = xray_prompt | xray_llm | StrOutputParser()
+
         parallel_branches["xray"] = RunnableLambda(
-            lambda _: xray_chain.invoke({
-                "xray_data": patient_case["xray_data"],
-                "rag_context": rag_ctx,
-            })
+            lambda _, chain=xray_chain, ctx=rag_ctx: _safe_invoke(
+                "xray", chain,
+                {
+                    "xray_data": patient_case["xray_data"],
+                    "rag_context": ctx,
+                }
+            )
         )
 
     if not parallel_branches:
@@ -388,9 +467,9 @@ def run_council_parallel(patient_case: dict) -> dict:
           f"{list(parallel_branches.keys())}")
 
     parallel_runner = RunnableParallel(**parallel_branches)
-    raw_results = parallel_runner.invoke({})  # input is ignored; lambdas capture data above
+    raw_results = parallel_runner.invoke({})
 
-    # ── Tag results with agent names ───────────────────────────────────────────
+    # ── Tag results — skip any that are fully empty ────────────────────────────
     agent_name_map = {
         "clinical": "Clinical Data Agent (GPT-4o)",
         "genomic":  "DNA/Genomic Agent (Gemini 2.5 Flash)",
@@ -398,12 +477,32 @@ def run_council_parallel(patient_case: dict) -> dict:
         "xray":     "X-Ray Agent (Qwen3 32B)",
     }
 
-    agent_conclusions = [
-        {"agent": agent_name_map[key], "conclusion": text}
-        for key, text in raw_results.items()
-    ]
+    agent_conclusions = []
+    for key, text in raw_results.items():
+        if text:  # skip completely empty results
+            agent_conclusions.append({
+                "agent": agent_name_map[key],
+                "conclusion": text,
+            })
 
-    print(f"\n[OK] {len(agent_conclusions)} agent(s) completed.\n")
+    available = [c["agent"] for c in agent_conclusions if "UNAVAILABLE" not in c["conclusion"]]
+    degraded  = [c["agent"] for c in agent_conclusions if "UNAVAILABLE"     in c["conclusion"]]
+
+    print(f"\n[OK]   Available agents  : {available}")
+    if degraded:
+        print(f"[WARN] Degraded agents   : {degraded}")
+    print()
+
+    # Guard: if ALL agents failed, return a clean error instead of sending an
+    # empty transcript to the Judge.
+    if not available:
+        return {
+            "error": "All agents failed. Check API keys and network connectivity.",
+            "agent_conclusions": agent_conclusions,
+            "verdict_text": "Council could not convene — all specialist agents failed.",
+            "needs_rag": False,
+            "rag_query": "",
+        }
 
     # ── Judge Agent with RAG retry loop ───────────────────────────────────────
     MAX_RAG_RETRIES = 2
